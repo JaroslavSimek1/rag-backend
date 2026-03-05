@@ -1,0 +1,140 @@
+import os
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qdrant_models
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import MarkdownTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_qdrant import QdrantVectorStore
+
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_LOCAL_PATH = os.getenv("QDRANT_LOCAL_PATH", "")
+
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+collection_name = "firecrawl_docs"
+
+if QDRANT_LOCAL_PATH:
+    qdrant_client = QdrantClient(path=QDRANT_LOCAL_PATH)
+else:
+    qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
+try:
+    qdrant_client.get_collection(collection_name)
+except Exception:
+    from qdrant_client.http.models import Distance, VectorParams
+
+    qdrant_client.create_collection(
+        collection_name=collection_name,
+        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+    )
+
+
+def index_markdown_file(file_path: str, url: str, job_id: int):
+    print(f"Indexing {file_path} into VectorDB...")
+    loader = TextLoader(file_path, encoding="utf-8")
+    docs = loader.load()
+
+    splitter = MarkdownTextSplitter(chunk_size=1000, chunk_overlap=150)
+    chunks = []
+
+    split_docs = splitter.split_documents(docs)
+    for chunk in split_docs:
+        chunk.metadata["url"] = url
+        chunk.metadata["job_id"] = str(job_id)
+        chunks.append(chunk)
+
+    if not chunks:
+        print("No chunks extracted from file.")
+        return
+
+    vector_store = QdrantVectorStore(
+        client=qdrant_client, collection_name=collection_name, embedding=embeddings
+    )
+    vector_store.add_documents(chunks)
+    print(f"Indexed {len(chunks)} chunks successfully.")
+
+
+def delete_job_vectors(job_id: int):
+    qdrant_client.delete(
+        collection_name=collection_name,
+        points_selector=qdrant_models.FilterSelector(
+            filter=qdrant_models.Filter(
+                must=[
+                    qdrant_models.FieldCondition(
+                        key="metadata.job_id",
+                        match=qdrant_models.MatchValue(value=str(job_id)),
+                    ),
+                ]
+            )
+        ),
+    )
+    print(f"Deleted vectors for job_id: {job_id}")
+
+
+def search_documents(query: str, k: int = 3):
+    vector_store = QdrantVectorStore(
+        client=qdrant_client, collection_name=collection_name, embedding=embeddings
+    )
+
+    results = vector_store.similarity_search_with_score(query, k=k)
+
+    formatted_results = []
+    for doc, score in results:
+        formatted_results.append(
+            {
+                "content": doc.page_content,
+                "metadata": doc.metadata,
+                "similarity_score": score,
+            }
+        )
+
+    return formatted_results
+
+
+def query_rag(query: str, k: int = 3):
+    from langchain_community.llms import Ollama
+    from langchain_core.prompts import PromptTemplate
+    import warnings
+
+    warnings.filterwarnings("ignore")
+
+    context_chunks = search_documents(query, k=k)
+
+    if not context_chunks:
+        return {
+            "answer": "Nebyly nalezeny žádné relevantní informace v databázi.",
+            "sources": [],
+        }
+
+    context_text = "\\n\\n---\\n\\n".join(
+        [chunk["content"] for chunk in context_chunks]
+    )
+
+    template = """
+    Jsi AI asistent pro RAG systém. Zodpovídej otázky JEN na základě poskytnutého kontextu.
+    Pokud v kontextu odpověď nevidíš, řekni slušně, že to nevíš. Nevymýšlej si.
+
+    Kontext:
+    {context}
+
+    Otázka od uživatele: {question}
+
+    Odpověď:"""
+
+    prompt = PromptTemplate(template=template, input_variables=["context", "question"])
+
+    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+    print(f"Initializing Ollama at {ollama_url}. Generating response...")
+    try:
+        llm = Ollama(model="llama3.2", base_url=ollama_url)
+        answer = llm.invoke(prompt.format(context=context_text, question=query))
+    except Exception as e:
+        print(f"Ollama generation failed: {e}")
+        answer = "Bohužel se nepodařilo spojit s Ollama modelem."
+
+    sources = [
+        {"path": r["metadata"].get("url", "unknown"), "score": r["similarity_score"]}
+        for r in context_chunks
+    ]
+
+    return {"answer": answer, "sources": sources}
