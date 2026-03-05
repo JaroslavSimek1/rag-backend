@@ -91,7 +91,7 @@ def search_documents(query: str, k: int = 3):
     return formatted_results
 
 
-def query_rag(query: str, k: int = 3):
+def query_rag(query: str, k: int = 5):
     from langchain_community.llms import Ollama
     from langchain_core.prompts import PromptTemplate
     import warnings
@@ -106,18 +106,22 @@ def query_rag(query: str, k: int = 3):
             "sources": [],
         }
 
-    context_text = "\\n\\n---\\n\\n".join(
-        [chunk["content"] for chunk in context_chunks]
-    )
+    context_text = "\n\n---\n\n".join([chunk["content"] for chunk in context_chunks])
 
     template = """
-    Jsi AI asistent pro RAG systém. Zodpovídej otázky JEN na základě poskytnutého kontextu.
-    Pokud v kontextu odpověď nevidíš, řekni slušně, že to nevíš. Nevymýšlej si.
+    Jsi AI asistent pro RAG (Retrieval-Augmented Generation) systém. 
+    Tvým úkolem je odpovídat na otázky uživatele VÝHRADNĚ na základě poskytnutého kontextu.
+
+    Pravidla:
+    1. Odpovídej v jazyce, ve kterém je položena otázka (typicky česky).
+    2. Pokud odpověď v kontextu NENÍ, řekni slušně, že ji neznáš. Nevymýšlej si fakta.
+    3. Hledej informace pečlivě i v popisech obrázků (alt texty), odkazech nebo seznamech.
+    4. Buď věcný a stručný.
 
     Kontext:
     {context}
 
-    Otázka od uživatele: {question}
+    Otázka: {question}
 
     Odpověď:"""
 
@@ -126,15 +130,21 @@ def query_rag(query: str, k: int = 3):
     ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
     print(f"Initializing Ollama at {ollama_url}. Generating response...")
     try:
-        llm = Ollama(model="llama3.2", base_url=ollama_url)
+        # Using a more robust prompt formatting and model selection
+        llm = Ollama(model="llama3.2", base_url=ollama_url, temperature=0.1)
         answer = llm.invoke(prompt.format(context=context_text, question=query))
     except Exception as e:
         print(f"Ollama generation failed: {e}")
-        answer = "Bohužel se nepodařilo spojit s Ollama modelem."
+        answer = (
+            "Bohužel se nepodařilo spojit s Ollama modelem nebo generování selhalo."
+        )
 
-    sources = [
-        {"path": r["metadata"].get("url", "unknown"), "score": r["similarity_score"]}
-        for r in context_chunks
-    ]
+    sources = []
+    seen_urls = set()
+    for r in context_chunks:
+        url = r["metadata"].get("url", "unknown")
+        if url not in seen_urls:
+            sources.append({"path": url, "score": r["similarity_score"]})
+            seen_urls.add(url)
 
     return {"answer": answer, "sources": sources}
