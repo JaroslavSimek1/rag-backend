@@ -10,8 +10,8 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_LOCAL_PATH = os.getenv("QDRANT_LOCAL_PATH", "")
 
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-collection_name = "firecrawl_docs"
+embeddings = HuggingFaceEmbeddings(model_name="paraphrase-multilingual-MiniLM-L12-v2")
+collection_name = "firecrawl_docs_v3"
 
 if QDRANT_LOCAL_PATH:
     qdrant_client = QdrantClient(path=QDRANT_LOCAL_PATH)
