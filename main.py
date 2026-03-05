@@ -165,6 +165,45 @@ def delete_job(job_id: int, db: Session = Depends(get_db)):
     return {"message": f"Job {job_id} deleted successfully"}
 
 
+@app.get("/api/jobs/{job_id}/files")
+def get_job_files(job_id: int):
+    """
+    Lists all .md files related to a specific job.
+    """
+    data_dir = os.getenv("DATA_DIR", "data")
+    if not os.path.exists(data_dir):
+        return {"files": []}
+
+    files = []
+    prefix = f"job_{job_id}_"
+    for filename in os.listdir(data_dir):
+        if filename.startswith(prefix) and filename.endswith(".md"):
+            files.append(filename)
+
+    return {"files": sorted(files)}
+
+
+@app.get("/api/files/{filename}")
+def get_file_content(filename: str):
+    """
+    Retrieves the content of a specific markdown file.
+    """
+    # Basic path traversal protection
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    data_dir = os.getenv("DATA_DIR", "data")
+    file_path = os.path.join(data_dir, filename)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    return {"content": content}
+
+
 if __name__ == "__main__":
     import uvicorn
 
