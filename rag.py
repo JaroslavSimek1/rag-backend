@@ -41,6 +41,7 @@ def index_markdown_file(file_path: str, url: str, job_id: int):
     for chunk in split_docs:
         chunk.metadata["url"] = url
         chunk.metadata["job_id"] = str(job_id)
+        chunk.metadata["filename"] = os.path.basename(file_path)
         chunks.append(chunk)
 
     if not chunks:
@@ -143,8 +144,11 @@ def query_rag(query: str, k: int = 5):
     seen_urls = set()
     for r in context_chunks:
         url = r["metadata"].get("url", "unknown")
+        filename = r["metadata"].get("filename", "")
         if url not in seen_urls:
-            sources.append({"path": url, "score": r["similarity_score"]})
+            sources.append(
+                {"path": url, "score": r["similarity_score"], "filename": filename}
+            )
             seen_urls.add(url)
 
     return {"answer": answer, "sources": sources}
