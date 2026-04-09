@@ -3,6 +3,8 @@ import re
 import base64
 import hashlib
 import tempfile
+from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
 import requests as http_requests
 from firecrawl import FirecrawlApp
 from models import init_db, Source, IngestJob, StrategyEnum, StatusEnum, Evidence
@@ -102,21 +104,63 @@ def _ocr_images_in_markdown(markdown: str) -> str:
     return IMAGE_MD_PATTERN.sub(_replace_image, markdown)
 
 
+def _check_robots_txt(url: str) -> bool:
+    """Check if crawling is allowed by robots.txt. Returns True if allowed."""
+    try:
+        parsed = urlparse(url)
+        robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+        rp = RobotFileParser()
+        rp.set_url(robots_url)
+        rp.read()
+        allowed = rp.can_fetch("*", url)
+        if not allowed:
+            print(f"[Robots.txt] Crawling BLOCKED for {url}")
+        return allowed
+    except Exception as e:
+        print(f"[Robots.txt] Could not fetch robots.txt for {url}: {e} — allowing crawl")
+        return True
+
+
 def _get_doc_url(doc, fallback_url: str) -> str:
     if isinstance(doc.metadata, dict):
         return doc.metadata.get("url", fallback_url)
     return doc.metadata.url if getattr(doc.metadata, "url", None) else fallback_url
 
 
-def ingest_url(url: str, source_id: int, deep_crawl: bool = False, max_depth: int = 2):
+def ingest_url(url: str, source_id: int, deep_crawl: bool = False, max_depth: int = 2,
+               preferred_strategy: str = None):
     db = init_db()
 
     print(f"Starting ingestion process for URL: {url}")
 
+    # Robots.txt check — skip if we have explicit consent/contract from site owner
+    source = db.query(Source).filter(Source.id == source_id).first()
+    override_robots = source and source.permission_type in ("consent", "contract")
+
+    if override_robots:
+        print(f"[Robots.txt] Skipping check for {url} — permission_type={source.permission_type}")
+    elif not _check_robots_txt(url):
+        print(f"[BLOCKED] robots.txt disallows crawling {url}")
+        job = IngestJob(
+            source_id=source_id, url=url, strategy=StrategyEnum.HTML,
+            status=StatusEnum.FAILED, max_depth=max_depth,
+            error_code="ROBOTS_TXT_BLOCKED",
+        )
+        db.add(job)
+        db.commit()
+        return
+
+    # Determine initial strategy
+    initial_strategy = StrategyEnum.HTML
+    if preferred_strategy:
+        strategy_map = {"html": StrategyEnum.HTML, "render": StrategyEnum.RENDER,
+                        "screenshot": StrategyEnum.SCREENSHOT}
+        initial_strategy = strategy_map.get(preferred_strategy.lower(), StrategyEnum.HTML)
+
     job = IngestJob(
         source_id=source_id,
         url=url,
-        strategy=StrategyEnum.HTML,
+        strategy=initial_strategy,
         status=StatusEnum.RUNNING,
         max_depth=max_depth,
     )
@@ -125,6 +169,11 @@ def ingest_url(url: str, source_id: int, deep_crawl: bool = False, max_depth: in
     db.refresh(job)
 
     try:
+        # Build scrape formats based on preferred strategy
+        formats = ["markdown", "html", "screenshot"]
+        if preferred_strategy == "screenshot":
+            formats = ["screenshot"]
+
         if deep_crawl:
             print(
                 f"[Strategy: CRAWLER] Initiating deep crawl for {url} with depth {max_depth}..."
@@ -133,14 +182,14 @@ def ingest_url(url: str, source_id: int, deep_crawl: bool = False, max_depth: in
                 url,
                 limit=30,
                 max_discovery_depth=max_depth,
-                scrape_options={"formats": ["markdown", "html", "screenshot"]},
+                scrape_options={"formats": formats},
             )
             scraped_docs = crawl_job.data
         else:
-            print(f"[Strategy: HTML] Attempting to scrape single page {url}...")
+            print(f"[Strategy: {initial_strategy.value}] Attempting to scrape single page {url}...")
             scrape_result = app.scrape(
                 url,
-                formats=["markdown", "html", "screenshot"],
+                formats=formats,
             )
             scraped_docs = [scrape_result]
 

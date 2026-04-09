@@ -145,9 +145,17 @@ def query_rag(query: str, k: int = 5):
     for r in context_chunks:
         url = r["metadata"].get("url", "unknown")
         filename = r["metadata"].get("filename", "")
+        fragment = r["content"][:300] if r["content"] else ""
+        job_id = r["metadata"].get("job_id", "")
         if url not in seen_urls:
             sources.append(
-                {"path": url, "score": r["similarity_score"], "filename": filename}
+                {
+                    "path": url,
+                    "score": r["similarity_score"],
+                    "filename": filename,
+                    "fragment": fragment,
+                    "job_id": job_id,
+                }
             )
             seen_urls.add(url)
 

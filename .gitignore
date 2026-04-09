@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+test_rag.db
+artifacts/job_*

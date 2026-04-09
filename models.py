@@ -17,11 +17,9 @@ Base = declarative_base()
 
 
 class StrategyEnum(enum.Enum):
-    API = "API"
     HTML = "HTML"
     RENDER = "Rendered DOM"
     SCREENSHOT = "Screenshot"
-    UPSTREAM = "Upstream AI"
 
 
 class StatusEnum(enum.Enum):

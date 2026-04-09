@@ -4,10 +4,12 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
-from models import get_db, Source, IngestJob, StatusEnum, Evidence, ScheduleEnum
+from models import get_db, Source, IngestJob, StatusEnum, Evidence, ScheduleEnum, StrategyEnum
 from ingestion import ingest_url
 from rag import query_rag, delete_job_vectors
 from auth import get_current_user, get_current_admin, UserInfo
@@ -49,6 +51,8 @@ class IngestRequest(BaseModel):
     deep_crawl: bool = False
     max_depth: int = 1
     schedule: Optional[str] = None
+    permission_type: str = "public"
+    strategy: Optional[str] = None
 
 
 class JobResponse(BaseModel):
@@ -66,10 +70,17 @@ def trigger_ingestion(
 ):
     source = db.query(Source).filter(Source.name == request.source_name).first()
     if not source:
-        source = Source(name=request.source_name, base_url=request.url)
+        source = Source(
+            name=request.source_name,
+            base_url=request.url,
+            permission_type=request.permission_type,
+        )
         db.add(source)
         db.commit()
         db.refresh(source)
+    elif request.permission_type != "public":
+        source.permission_type = request.permission_type
+        db.commit()
 
     if request.schedule:
         try:
@@ -99,7 +110,8 @@ def trigger_ingestion(
         )
 
     background_tasks.add_task(
-        ingest_url, request.url, source.id, request.deep_crawl, request.max_depth
+        ingest_url, request.url, source.id, request.deep_crawl, request.max_depth,
+        request.strategy,
     )
 
     status_msg = "updated" if existing_job else "started"
@@ -120,15 +132,20 @@ def get_jobs(
 
     result = []
     for j in jobs:
-        evidence = db.query(Evidence).filter(Evidence.job_id == j.id).first()
+        evidences = db.query(Evidence).filter(Evidence.job_id == j.id).all()
+        screenshots = [e for e in evidences if e.evidence_type == "screenshot"]
         result.append(
             {
                 "id": j.id,
                 "url": j.url,
                 "status": j.status.value,
+                "strategy": j.strategy.value if j.strategy else None,
                 "error_code": j.error_code,
                 "started_ts": j.started_ts,
-                "has_evidence": evidence is not None,
+                "completed_ts": j.completed_ts,
+                "max_depth": j.max_depth,
+                "has_evidence": len(evidences) > 0,
+                "screenshot_count": len(screenshots),
             }
         )
     return {"jobs": result}
@@ -182,6 +199,105 @@ def get_job_files(
     return {"files": sorted(files)}
 
 
+# ── Evidence / screenshots (admin only) ──────────────────────────────────
+
+
+@app.get("/api/jobs/{job_id}/screenshots")
+def get_job_screenshots(
+    job_id: int,
+    db: Session = Depends(get_db),
+    admin: UserInfo = Depends(get_current_admin),
+):
+    evidences = (
+        db.query(Evidence)
+        .filter(Evidence.job_id == job_id, Evidence.evidence_type == "screenshot")
+        .all()
+    )
+    return {
+        "screenshots": [
+            {
+                "id": e.id,
+                "storage_uri": e.storage_uri,
+                "file_hash": e.file_hash,
+                "created_ts": e.created_ts,
+            }
+            for e in evidences
+        ]
+    }
+
+
+@app.get("/api/evidence/{evidence_id}/file")
+def get_evidence_file(
+    evidence_id: int,
+    db: Session = Depends(get_db),
+    admin: UserInfo = Depends(get_current_admin),
+):
+    evidence = db.query(Evidence).filter(Evidence.id == evidence_id).first()
+    if not evidence:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    if not evidence.storage_uri or not os.path.exists(evidence.storage_uri):
+        raise HTTPException(status_code=404, detail="Evidence file not found on disk")
+
+    return FileResponse(evidence.storage_uri, media_type="image/png")
+
+
+# ── Job detail / resolve (admin only) ────────────────────────────────────
+
+
+@app.get("/api/jobs/{job_id}/detail")
+def get_job_detail(
+    job_id: int,
+    db: Session = Depends(get_db),
+    admin: UserInfo = Depends(get_current_admin),
+):
+    job = db.query(IngestJob).filter(IngestJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    evidences = db.query(Evidence).filter(Evidence.job_id == job_id).all()
+    source = db.query(Source).filter(Source.id == job.source_id).first()
+
+    return {
+        "id": job.id,
+        "url": job.url,
+        "status": job.status.value,
+        "strategy": job.strategy.value if job.strategy else None,
+        "error_code": job.error_code,
+        "started_ts": job.started_ts,
+        "completed_ts": job.completed_ts,
+        "max_depth": job.max_depth,
+        "source_name": source.name if source else None,
+        "evidences": [
+            {
+                "id": e.id,
+                "type": e.evidence_type,
+                "storage_uri": e.storage_uri,
+                "file_hash": e.file_hash,
+                "created_ts": e.created_ts,
+            }
+            for e in evidences
+        ],
+    }
+
+
+@app.put("/api/jobs/{job_id}/resolve")
+def resolve_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    admin: UserInfo = Depends(get_current_admin),
+):
+    job = db.query(IngestJob).filter(IngestJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status not in (StatusEnum.FAILED, StatusEnum.CAPTCHA_DETECTED):
+        raise HTTPException(status_code=400, detail="Only failed/blocked jobs can be resolved")
+
+    job.status = StatusEnum.COMPLETED
+    job.error_code = f"RESOLVED: {job.error_code or 'manual'}"
+    db.commit()
+    return {"message": f"Job {job_id} marked as resolved"}
+
+
 # ── Sources / schedule management (admin only) ───────────────────────────
 
 
@@ -201,6 +317,7 @@ def get_sources(
                 "id": s.id,
                 "name": s.name,
                 "base_url": s.base_url,
+                "permission_type": s.permission_type,
                 "schedule": s.schedule_interval.value if s.schedule_interval else None,
                 "last_scheduled_ts": s.last_scheduled_ts,
             }
@@ -230,6 +347,56 @@ def update_schedule(
 
     db.commit()
     return {"message": f"Schedule updated for source '{source.name}'"}
+
+
+# ── Analytics (admin only) ───────────────────────────────────────────────
+
+
+@app.get("/api/analytics")
+def get_analytics(
+    db: Session = Depends(get_db),
+    admin: UserInfo = Depends(get_current_admin),
+):
+    total_jobs = db.query(func.count(IngestJob.id)).scalar() or 0
+    completed = db.query(func.count(IngestJob.id)).filter(IngestJob.status == StatusEnum.COMPLETED).scalar() or 0
+    failed = db.query(func.count(IngestJob.id)).filter(IngestJob.status == StatusEnum.FAILED).scalar() or 0
+    running = db.query(func.count(IngestJob.id)).filter(IngestJob.status == StatusEnum.RUNNING).scalar() or 0
+    captcha = db.query(func.count(IngestJob.id)).filter(IngestJob.status == StatusEnum.CAPTCHA_DETECTED).scalar() or 0
+
+    total_sources = db.query(func.count(Source.id)).scalar() or 0
+    scheduled_sources = db.query(func.count(Source.id)).filter(Source.schedule_interval.isnot(None)).scalar() or 0
+
+    total_evidences = db.query(func.count(Evidence.id)).scalar() or 0
+    screenshots = db.query(func.count(Evidence.id)).filter(Evidence.evidence_type == "screenshot").scalar() or 0
+    markdowns = db.query(func.count(Evidence.id)).filter(Evidence.evidence_type == "markdown").scalar() or 0
+
+    # Strategy breakdown
+    strategy_counts = {}
+    for s in StrategyEnum:
+        cnt = db.query(func.count(IngestJob.id)).filter(IngestJob.strategy == s).scalar() or 0
+        if cnt > 0:
+            strategy_counts[s.value] = cnt
+
+    # Recent jobs (last 20)
+    recent = db.query(IngestJob).order_by(IngestJob.started_ts.desc()).limit(20).all()
+    recent_jobs = [
+        {
+            "id": j.id,
+            "url": j.url,
+            "status": j.status.value,
+            "strategy": j.strategy.value if j.strategy else None,
+            "started_ts": j.started_ts,
+        }
+        for j in recent
+    ]
+
+    return {
+        "jobs": {"total": total_jobs, "completed": completed, "failed": failed, "running": running, "captcha": captcha},
+        "sources": {"total": total_sources, "scheduled": scheduled_sources},
+        "evidences": {"total": total_evidences, "screenshots": screenshots, "markdowns": markdowns},
+        "strategies": strategy_counts,
+        "recent_jobs": recent_jobs,
+    }
 
 
 # ── Public endpoints ─────────────────────────────────────────────────────
