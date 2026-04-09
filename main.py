@@ -1,15 +1,28 @@
 import os
+from contextlib import asynccontextmanager
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from models import init_db, Source, IngestJob, StatusEnum, Evidence
+
+from models import get_db, Source, IngestJob, StatusEnum, Evidence, ScheduleEnum
 from ingestion import ingest_url
 from rag import query_rag, delete_job_vectors
+from auth import get_current_user, get_current_admin, UserInfo
+from scheduler import start_scheduler, stop_scheduler
 
-app = FastAPI(title="Web Data Ingestion API")
 
-# Setup CORS for the frontend
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    start_scheduler()
+    yield
+    stop_scheduler()
+
+
+app = FastAPI(title="Web Data Ingestion API", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,13 +32,15 @@ app.add_middleware(
 )
 
 
-# Dependency to get DB session
-def get_db():
-    db = init_db()
-    try:
-        yield db
-    finally:
-        db.close()
+# ── Auth info (Keycloak handles login/register/user management) ──────────
+
+
+@app.get("/api/auth/me")
+def get_me(user: UserInfo = Depends(get_current_user)):
+    return {"id": user.id, "username": user.username, "role": user.role}
+
+
+# ── Ingestion endpoints (admin only) ─────────────────────────────────────
 
 
 class IngestRequest(BaseModel):
@@ -33,12 +48,13 @@ class IngestRequest(BaseModel):
     source_name: str = "DefaultSource"
     deep_crawl: bool = False
     max_depth: int = 1
+    schedule: Optional[str] = None
 
 
 class JobResponse(BaseModel):
     message: str
     source_id: int
-    status: str = "started"  # started, skipped, updated
+    status: str = "started"
 
 
 @app.post("/api/ingest", response_model=JobResponse)
@@ -46,12 +62,8 @@ def trigger_ingestion(
     request: IngestRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    admin: UserInfo = Depends(get_current_admin),
 ):
-    """
-    Endpoint to trigger an ingestion job for a given URL.
-    The actual scraping runs in the background.
-    """
-    # Find or create source
     source = db.query(Source).filter(Source.name == request.source_name).first()
     if not source:
         source = Source(name=request.source_name, base_url=request.url)
@@ -59,7 +71,19 @@ def trigger_ingestion(
         db.commit()
         db.refresh(source)
 
-    # Smart Ingest: Check if we already have this URL with sufficient depth
+    if request.schedule:
+        try:
+            source.schedule_interval = ScheduleEnum(request.schedule)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid schedule: {request.schedule}. Use: hourly, daily, weekly, monthly",
+            )
+        db.commit()
+    elif request.schedule is not None:
+        source.schedule_interval = None
+        db.commit()
+
     existing_job = (
         db.query(IngestJob)
         .filter(IngestJob.url == request.url, IngestJob.status == StatusEnum.COMPLETED)
@@ -74,7 +98,6 @@ def trigger_ingestion(
             status="skipped",
         )
 
-    # We trigger the ingestion in the background so the UI doesn't hang
     background_tasks.add_task(
         ingest_url, request.url, source.id, request.deep_crawl, request.max_depth
     )
@@ -88,10 +111,11 @@ def trigger_ingestion(
 
 
 @app.get("/api/jobs")
-def get_jobs(limit: int = 10, db: Session = Depends(get_db)):
-    """
-    Endpoint to fetch the latest ingestion jobs and their statuses.
-    """
+def get_jobs(
+    limit: int = 10,
+    db: Session = Depends(get_db),
+    admin: UserInfo = Depends(get_current_admin),
+):
     jobs = db.query(IngestJob).order_by(IngestJob.started_ts.desc()).limit(limit).all()
 
     result = []
@@ -110,55 +134,30 @@ def get_jobs(limit: int = 10, db: Session = Depends(get_db)):
     return {"jobs": result}
 
 
-class SearchRequest(BaseModel):
-    query: str
-    k: int = 3
-
-
-@app.post("/api/search")
-def search_api(request: SearchRequest):
-    """
-    Endpoint to perform RAG search on the ingested knowledge base, synthesized by local Ollama.
-    """
-    try:
-        # Call query_rag which retrieves chunks and synthesizes via Ollama
-        result_payload = query_rag(request.query, k=request.k)
-
-        return result_payload
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.delete("/api/jobs/{job_id}")
-def delete_job(job_id: int, db: Session = Depends(get_db)):
-    """
-    Deletes a job from DB, removes its files and its vectors from Qdrant.
-    """
+def delete_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    admin: UserInfo = Depends(get_current_admin),
+):
     job = db.query(IngestJob).filter(IngestJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # 1. Delete vectors from Qdrant
     try:
         delete_job_vectors(job_id)
     except Exception as e:
         print(f"Warning: Failed to delete vectors for job {job_id}: {e}")
 
-    # 2. Delete Evidence and Files
     evidences = db.query(Evidence).filter(Evidence.job_id == job_id).all()
     for ev in evidences:
-        # In a real app we'd delete the files from disk here too
-        # For PoC, the filenames are stored in DB, we'll try to remove them if they exist
-        for path_attr in ["html_path", "screenshot_path"]:
-            path = getattr(ev, path_attr)
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
+        if ev.storage_uri and os.path.exists(ev.storage_uri):
+            try:
+                os.remove(ev.storage_uri)
+            except Exception:
+                pass
         db.delete(ev)
 
-    # 3. Delete Job itself
     db.delete(job)
     db.commit()
 
@@ -166,10 +165,10 @@ def delete_job(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/api/jobs/{job_id}/files")
-def get_job_files(job_id: int):
-    """
-    Lists all .md files related to a specific job.
-    """
+def get_job_files(
+    job_id: int,
+    admin: UserInfo = Depends(get_current_admin),
+):
     data_dir = os.getenv("DATA_DIR", "data")
     if not os.path.exists(data_dir):
         return {"files": []}
@@ -183,12 +182,75 @@ def get_job_files(job_id: int):
     return {"files": sorted(files)}
 
 
+# ── Sources / schedule management (admin only) ───────────────────────────
+
+
+class ScheduleRequest(BaseModel):
+    schedule: Optional[str] = None
+
+
+@app.get("/api/sources")
+def get_sources(
+    db: Session = Depends(get_db),
+    admin: UserInfo = Depends(get_current_admin),
+):
+    sources = db.query(Source).order_by(Source.id.desc()).all()
+    return {
+        "sources": [
+            {
+                "id": s.id,
+                "name": s.name,
+                "base_url": s.base_url,
+                "schedule": s.schedule_interval.value if s.schedule_interval else None,
+                "last_scheduled_ts": s.last_scheduled_ts,
+            }
+            for s in sources
+        ]
+    }
+
+
+@app.put("/api/sources/{source_id}/schedule")
+def update_schedule(
+    source_id: int,
+    request: ScheduleRequest,
+    db: Session = Depends(get_db),
+    admin: UserInfo = Depends(get_current_admin),
+):
+    source = db.query(Source).filter(Source.id == source_id).first()
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    if request.schedule:
+        try:
+            source.schedule_interval = ScheduleEnum(request.schedule)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid schedule: {request.schedule}")
+    else:
+        source.schedule_interval = None
+
+    db.commit()
+    return {"message": f"Schedule updated for source '{source.name}'"}
+
+
+# ── Public endpoints ─────────────────────────────────────────────────────
+
+
+class SearchRequest(BaseModel):
+    query: str
+    k: int = 3
+
+
+@app.post("/api/search")
+def search_api(request: SearchRequest):
+    try:
+        result_payload = query_rag(request.query, k=request.k)
+        return result_payload
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/files/{filename}")
 def get_file_content(filename: str):
-    """
-    Retrieves the content of a specific markdown file.
-    """
-    # Basic path traversal protection
     if ".." in filename or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 

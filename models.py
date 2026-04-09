@@ -32,6 +32,13 @@ class StatusEnum(enum.Enum):
     CAPTCHA_DETECTED = "CAPTCHA_DETECTED"
 
 
+class ScheduleEnum(enum.Enum):
+    HOURLY = "hourly"
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+
+
 class Source(Base):
     __tablename__ = "sources"
 
@@ -41,6 +48,8 @@ class Source(Base):
     permission_type = Column(String, default="public")
     crawl_rules = Column(Text, nullable=True)
     retention_rules = Column(String, default="30_days")
+    schedule_interval = Column(Enum(ScheduleEnum), nullable=True)
+    last_scheduled_ts = Column(DateTime, nullable=True)
 
     jobs = relationship("IngestJob", back_populates="source")
 
@@ -78,13 +87,24 @@ class Evidence(Base):
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./rag_storage.db")
+_connect_args = (
+    {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+)
+engine = create_engine(DATABASE_URL, connect_args=_connect_args)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db():
-    connect_args = (
-        {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-    )
-    engine = create_engine(DATABASE_URL, connect_args=connect_args)
+    """Create all tables and return a new session."""
     Base.metadata.create_all(bind=engine)
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     return SessionLocal()
+
+
+def get_db():
+    """FastAPI dependency that yields a DB session."""
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
