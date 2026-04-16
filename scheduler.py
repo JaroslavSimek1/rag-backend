@@ -31,8 +31,12 @@ def check_scheduled_sources():
             if not interval:
                 continue
 
-            if source.last_scheduled_ts and (now - source.last_scheduled_ts) < interval:
-                continue
+            last_ts = source.last_scheduled_ts
+            if last_ts:
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=timezone.utc)
+                if (now - last_ts) < interval:
+                    continue
 
             print(f"[Scheduler] Triggering scheduled ingest for source '{source.name}' ({source.base_url})")
             source.last_scheduled_ts = now
